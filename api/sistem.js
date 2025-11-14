@@ -253,12 +253,12 @@ async function fetchRemoteUsers(opts = {}) {
 
   for (let i = 0; i < retries; i++) {
     try {
-      // Use fetchJson (safe fetch + timeout) if available; else fallback to fetch
+      // prefer fetchJson if present (has timeout/normalize), else fetch raw
       if (typeof fetchJson === 'function') {
         const data = await fetchJson(cacheBustedUrl, { timeout: timeoutMs });
         if (Array.isArray(data)) {
-          console.log(`[sistem] fetchRemoteUsers success (attempt ${i+1}) - ${data.length} users`);
           if (typeof setUsersCache === 'function') setUsersCache(data);
+          console.log(`[sistem] fetchRemoteUsers success (attempt ${i+1}) - ${data.length} users`);
           return data;
         }
         throw new Error('Remote payload is not an array');
@@ -311,8 +311,8 @@ async function fetchRemoteUsers(opts = {}) {
               const normalized = normalizePossiblyUnquotedJson(content);
               const parsed = JSON.parse(normalized);
               if (Array.isArray(parsed)) {
-                console.log('[sistem] GitHub API fallback success - users:', parsed.length);
                 if (typeof setUsersCache === 'function') setUsersCache(parsed);
+                console.log('[sistem] GitHub API fallback success - users:', parsed.length);
                 return parsed;
               }
             }
@@ -331,6 +331,7 @@ async function fetchRemoteUsers(opts = {}) {
 
   throw lastErr || new Error('Failed to fetch remote users after retries');
 }
+          
 // ==============================================
 
 module.exports = async (req, res) => {
