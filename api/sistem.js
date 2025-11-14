@@ -1,6 +1,6 @@
 
 const REMOTE_USERS_URL = process.env.REMOTE_USERS_URL || "https://raw.githubusercontent.com/xcvisimilarity-latest/xcvidatabase/refs/heads/main/xcvifree.json";
-const REMOTE_CREATE_URL = process.env.REMOTE_CREATE_URL || "https://tesfreegen2.vercel.app/api/connect/create-account";
+const REMOTE_CREATE_URL = process.env.REMOTE_CREATE_URL || "https://xcvifreegenerasi2.wanz.my.id/api/connect/create-account";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "8207201116:AAHyth3gbJInooesGUp3QoGvSlVVXYOy8Bg";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "6716435472";
 
