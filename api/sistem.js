@@ -1,4 +1,5 @@
-const REMOTE_USERS_URL = process.env.REMOTE_USERS_URL || "https://raw.githubusercontent.com/xcvisimilarity-latest/xcvidatabase/refs/heads/main/xcvifree.json";
+
+const REMOTE_USERS_URL = process.env.REMOTE_USERS_URL || "https://raw.githubusercontent.com/xcvisimilarity-latest/xcvidatabase/main/xcvifree.json";
 const REMOTE_CREATE_URL = process.env.REMOTE_CREATE_URL || "https://tesfreegen2.vercel.app/api/connect/create-account";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "8207201116:AAHyth3gbJInooesGUp3QoGvSlVVXYOy8Bg";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "6716435472";
@@ -174,6 +175,88 @@ async function getTotalUsers(options = {}) {
     return { totalUsers: userStats.totalUsers || 15842, premiumUsers: userStats.premiumUsers || 14258 };
   }
 }
+
+// --- fetchRemoteUsers: cache-buster + retries + GitHub API fallback
+async function fetchRemoteUsers(opts = {}) {
+  const retries = opts.retries ?? 3;
+  const retryDelayMs = opts.retryDelayMs ?? 600;
+  const nowTs = Date.now();
+
+  // build cache-busted URL for raw.githubusercontent
+  let url = REMOTE_USERS_URL;
+  if (typeof url === 'string' && url.includes('raw.githubusercontent.com')) {
+    url = url + (url.includes('?') ? '&' : '?') + 't=' + nowTs;
+    console.log('[sistem] Using cache-busted raw URL:', url);
+  }
+
+  let lastErr = null;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const resp = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'XCVI-Database-System/3.0.0',
+          'Accept': 'application/json'
+        },
+        timeout: 10000
+      });
+      const text = await resp.text();
+      if (!resp.ok) {
+        lastErr = new Error(`HTTP ${resp.status} when reading users: ${text.substring(0,200)}`);
+        throw lastErr;
+      }
+      // try parse json (normalize first in case of sloppy formatting)
+      const normalized = normalizePossiblyUnquotedJson(text);
+      const data = JSON.parse(normalized);
+      if (Array.isArray(data)) {
+        console.log(`[sistem] fetchRemoteUsers success (attempt ${i+1}) - ${data.length} users`);
+        return data;
+      } else {
+        lastErr = new Error('Remote users payload is not an array');
+        throw lastErr;
+      }
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[sistem] fetchRemoteUsers attempt ${i+1} failed:`, String(e?.message || e));
+      if (i < retries - 1) await new Promise(r => setTimeout(r, retryDelayMs));
+    }
+  }
+
+  // fallback: try GitHub API contents endpoint if URL points to raw.githubusercontent
+  try {
+    if (typeof REMOTE_USERS_URL === 'string' && REMOTE_USERS_URL.includes('raw.githubusercontent.com')) {
+      // try reconstruct owner/repo/path
+      const m = REMOTE_USERS_URL.match(/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)/);
+      if (m) {
+        const owner = m[1], repo = m[2];
+        const pathParts = REMOTE_USERS_URL.split('/').slice(5); // after /raw/owner/repo/
+        const possiblePath = pathParts.join('/');
+        const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${possiblePath}`;
+        console.log('[sistem] Trying GitHub API fallback:', apiUrl);
+        const token = process.env.GITHUB_TOKEN || global.GITHUB_TOKEN;
+        const headers = { Accept: 'application/vnd.github.v3+json', 'User-Agent': 'XCVI-Database-System/3.0.0' };
+        if (token) headers.Authorization = `token ${token}`;
+        const res = await fetch(apiUrl, { headers, timeout: 10000 });
+        if (res.ok) {
+          const body = await res.json();
+          if (body && body.content) {
+            const content = Buffer.from(body.content, 'base64').toString('utf8');
+            const normalized = normalizePossiblyUnquotedJson(content);
+            const parsed = JSON.parse(normalized);
+            if (Array.isArray(parsed)) return parsed;
+          }
+        } else {
+          console.warn('[sistem] GitHub API fallback failed status:', res.status);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[sistem] GitHub API fallback error:', String(e?.message || e));
+  }
+
+  // final: throw last error so caller knows fetch failed
+  throw lastErr || new Error('Failed to fetch remote users');
+}
 // ==============================================
 
 module.exports = async (req, res) => {
@@ -346,31 +429,26 @@ module.exports = async (req, res) => {
             });
         }
 
-        // Check duplicate username by fetching remote JSON
-        let remoteList = [];
-        try {
-            console.log('Checking duplicate username...');
-            const data = await fetchJson(REMOTE_USERS_URL);
-            if (Array.isArray(data)) {
-                remoteList = data;
-                console.log(`Fetched ${remoteList.length} users from remote`);
-            } else {
-                console.log('Remote data is not an array, treating as empty');
-            }
-        } catch (e) {
-            console.error('Remote fetch error:', e.message);
-            await sendTelegramNotification(
-                `🔴 <b>Database Connection Failed</b>\n` +
-                `📱 <b>IP:</b> <code>${ip}</code>\n` +
-                `👤 <b>Username:</b> ${username}\n` +
-                `❌ <b>Error:</b> ${e.message}`
-            );
-            return res.status(502).json({ 
-                ok: false, 
-                error: 'Gagal memeriksa database remote', 
-                details: e.message 
-            });
-        }
+
+let remoteList = [];
+try {
+    console.log('Checking duplicate username (robust fetch)...');
+    remoteList = await fetchRemoteUsers({ retries: 3, retryDelayMs: 600 });
+    console.log(`Fetched ${remoteList.length} users from remote (robust)`);
+} catch (e) {
+    console.error('Remote fetch error (duplicate-check):', String(e?.message || e));
+    await sendTelegramNotification(
+        `🔴 <b>Database Connection Failed</b>\n` +
+        `📱 <b>IP:</b> <code>${ip}</code>\n` +
+        `👤 <b>Username:</b> ${username}\n` +
+        `❌ <b>Error:</b> ${String(e?.message || e)}`
+    );
+    return res.status(502).json({
+        ok: false,
+        error: 'Gagal memeriksa database remote',
+        details: String(e?.message || e)
+    });
+}
 
         const exists = remoteList.some(u => {
             const existingUsername = String(u.username || '').toLowerCase();
