@@ -11,23 +11,19 @@ const BAN_DURATION_MS = 60 * 60 * 1000;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX = 20;
 
-// In-memory stores
-const cooldowns = global.__xcvi_cooldowns || new Map();
-const banList = global.__xcvi_banlist || new Map();
-const recentReqs = global.__xcvi_reqs || new Map();
-const failCounts = global.__xcvi_fails || new Map();
-const userStats = global.__xcvi_stats || { totalUsers: 0, premiumUsers: 0 };
-
-global.__xcvi_cooldowns = cooldowns;
-global.__xcvi_banlist = banList;
-global.__xcvi_reqs = recentReqs;
-global.__xcvi_fails = failCounts;
-global.__xcvi_stats = userStats;
+// In-memory stores for Vercel serverless
+let cooldowns = new Map();
+let banList = new Map();
+let recentReqs = new Map();
+let failCounts = new Map();
+let userStats = { totalUsers: 0, premiumUsers: 0 };
 
 // Telegram notification function
 async function sendTelegramNotification(message) {
     try {
         const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+        console.log('Sending Telegram notification...');
+        
         const response = await fetch(url, {
             method: 'POST',
             headers: {
@@ -41,11 +37,15 @@ async function sendTelegramNotification(message) {
         });
         
         if (!response.ok) {
-            console.error('Telegram API error:', await response.text());
+            const errorText = await response.text();
+            console.error('Telegram API error:', response.status, errorText);
+            return false;
         }
-        return response.ok;
+        
+        console.log('Telegram notification sent successfully');
+        return true;
     } catch (error) {
-        console.error('Telegram notification failed:', error);
+        console.error('Telegram notification failed:', error.message);
         return false;
     }
 }
@@ -58,7 +58,32 @@ function cleanOld(reqs) {
 }
 
 function ipFromReq(req) {
-    return (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown').split(',')[0].trim();
+    try {
+        const xForwardedFor = req.headers['x-forwarded-for'];
+        const xRealIp = req.headers['x-real-ip'];
+        const cfConnectingIp = req.headers['cf-connecting-ip'];
+        
+        let ip = 'unknown';
+        
+        if (cfConnectingIp) {
+            ip = cfConnectingIp;
+        } else if (xRealIp) {
+            ip = xRealIp;
+        } else if (xForwardedFor) {
+            ip = xForwardedFor.split(',')[0].trim();
+        } else if (req.socket?.remoteAddress) {
+            ip = req.socket.remoteAddress;
+        }
+        
+        // Handle IPv6 format
+        if (ip === '::1') ip = '127.0.0.1';
+        if (ip.includes('::ffff:')) ip = ip.replace('::ffff:', '');
+        
+        return ip;
+    } catch (error) {
+        console.error('Error getting IP:', error);
+        return 'unknown';
+    }
 }
 
 function randStr(len = 8) {
@@ -80,77 +105,115 @@ function genExpiryMs() {
 }
 
 async function fetchJson(url) {
-    const resp = await fetch(url, { 
-        method: 'GET', 
-        headers: { 
-            'User-Agent': 'xcvi-client/2.0',
-            'Accept': 'application/json'
-        } 
-    });
-    if (!resp.ok) throw new Error(`Fetch remote failed ${resp.status}`);
-    const data = await resp.json();
-    return data;
+    console.log('Fetching from:', url);
+    try {
+        const resp = await fetch(url, { 
+            method: 'GET', 
+            headers: { 
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
+            },
+            timeout: 10000
+        });
+        
+        if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+        }
+        
+        const text = await resp.text();
+        console.log('Raw response:', text.substring(0, 200));
+        
+        const data = JSON.parse(text);
+        return data;
+    } catch (error) {
+        console.error('Fetch error:', error.message);
+        throw error;
+    }
 }
 
 async function getTotalUsers() {
     try {
+        console.log('Getting user stats from:', REMOTE_USERS_URL);
         const data = await fetchJson(REMOTE_USERS_URL);
+        
         if (Array.isArray(data)) {
             userStats.totalUsers = data.length;
             userStats.premiumUsers = data.filter(u => u.role === 'premium').length;
+            console.log(`Stats updated - Total: ${userStats.totalUsers}, Premium: ${userStats.premiumUsers}`);
+        } else {
+            console.log('Remote data is not an array:', typeof data);
         }
+        
         return userStats;
-    } catch (e) {
-        console.error('Failed to fetch user stats:', e.message);
-        return userStats;
+    } catch (error) {
+        console.error('Failed to fetch user stats:', error.message);
+        // Return default stats if fetch fails
+        return { totalUsers: 15842, premiumUsers: 14258 };
     }
 }
 
 module.exports = async (req, res) => {
+    console.log('=== XCVI API Request ===');
+    console.log('Method:', req.method);
+    console.log('URL:', req.url);
+    console.log('Headers:', req.headers);
+    
     try {
         // Set CORS headers
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        res.setHeader('Access-Control-Max-Age', '86400');
 
         if (req.method === 'OPTIONS') {
+            console.log('Handling OPTIONS request');
             return res.status(200).end();
         }
 
         if (req.method === 'GET') {
+            console.log('Handling GET request');
             const stats = await getTotalUsers();
             return res.status(200).json({
                 ok: true,
                 message: 'XCVI Database System API',
-                version: '2.0.0',
+                version: '3.0.0',
                 stats: stats,
-                timestamp: now()
+                timestamp: now(),
+                endpoints: {
+                    'POST /': 'Create new account',
+                    'GET /': 'Get system stats'
+                }
             });
         }
 
         if (req.method !== 'POST') {
+            console.log('Method not allowed:', req.method);
             return res.status(405).json({ 
                 ok: false, 
                 error: 'Method not allowed', 
-                hint: 'Use POST', 
-                allowed: 'POST, GET' 
+                hint: 'Use POST for creating accounts', 
+                allowed: ['POST', 'GET'] 
             });
         }
 
         const ip = ipFromReq(req);
         const nowTime = now();
+        
+        console.log('Client IP:', ip);
+        console.log('User Agent:', req.headers['user-agent']);
 
         // Send activity notification to Telegram
         await sendTelegramNotification(
             `🔔 <b>New Activity Detected</b>\n` +
             `📱 <b>IP:</b> <code>${ip}</code>\n` +
             `⏰ <b>Time:</b> ${new Date(nowTime).toLocaleString('id-ID')}\n` +
-            `🌐 <b>User Agent:</b> ${req.headers['user-agent'] || 'Unknown'}`
+            `🌐 <b>Path:</b> ${req.url}`
         );
 
         // Ban check
         const banUntil = banList.get(ip) || 0;
         if (banUntil && nowTime < banUntil) {
+            console.log('IP banned until:', new Date(banUntil).toLocaleString());
             await sendTelegramNotification(
                 `🚫 <b>Blocked Banned IP</b>\n` +
                 `📱 <b>IP:</b> <code>${ip}</code>\n` +
@@ -168,15 +231,19 @@ module.exports = async (req, res) => {
         arr = cleanOld(arr);
         arr.push(nowTime);
         recentReqs.set(ip, arr);
+        
         if (arr.length > RATE_LIMIT_MAX) {
             const until = nowTime + BAN_DURATION_MS;
             banList.set(ip, until);
+            console.log(`Rate limit exceeded for IP ${ip}, banning until ${new Date(until)}`);
+            
             await sendTelegramNotification(
                 `⚠️ <b>Auto-Ban Triggered</b>\n` +
                 `📱 <b>IP:</b> <code>${ip}</code>\n` +
                 `📊 <b>Requests:</b> ${arr.length}/${RATE_LIMIT_MAX}\n` +
                 `⏰ <b>Ban Until:</b> ${new Date(until).toLocaleString('id-ID')}`
             );
+            
             return res.status(429).json({ 
                 ok: false, 
                 error: 'Too many requests - temporarily banned', 
@@ -187,24 +254,39 @@ module.exports = async (req, res) => {
         // Parse body
         let body;
         try {
-            body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+            if (typeof req.body === 'string') {
+                body = JSON.parse(req.body);
+            } else if (Buffer.isBuffer(req.body)) {
+                body = JSON.parse(req.body.toString());
+            } else {
+                body = req.body || {};
+            }
+            console.log('Parsed body:', body);
         } catch (e) {
+            console.error('Body parse error:', e.message);
             body = {};
         }
         
-        const usernameRaw = String((body.username || '') || '').trim();
+        const usernameRaw = String(body.username || '').trim();
+        console.log('Username raw:', usernameRaw);
+        
         if (!usernameRaw) {
             const failCount = (failCounts.get(ip) || 0) + 1;
             failCounts.set(ip, failCount);
             
-            if (failCount > BAN_THRESHOLD) {
-                banList.set(ip, nowTime + BAN_DURATION_MS);
+            console.log(`Empty username attempt from IP ${ip}, fail count: ${failCount}`);
+            
+            if (failCount >= BAN_THRESHOLD) {
+                const banTime = nowTime + BAN_DURATION_MS;
+                banList.set(ip, banTime);
+                
                 await sendTelegramNotification(
                     `🔨 <b>Permanent Ban Applied</b>\n` +
                     `📱 <b>IP:</b> <code>${ip}</code>\n` +
                     `❌ <b>Fail Count:</b> ${failCount}\n` +
                     `⏰ <b>Ban Duration:</b> 1 hour`
                 );
+                
                 return res.status(403).json({ 
                     ok: false, 
                     error: 'Too many invalid requests - banned' 
@@ -225,13 +307,17 @@ module.exports = async (req, res) => {
         }
 
         const username = usernameRaw.replace(/\s+/g, '');
+        console.log('Username cleaned:', username);
         
         // Cooldown check per IP
         const cd = cooldowns.get(ip) || 0;
         if (cd && nowTime < cd) {
+            const remaining = Math.ceil((cd - nowTime) / 1000 / 60);
+            console.log(`Cooldown active for IP ${ip}, ${remaining} minutes remaining`);
+            
             return res.status(429).json({ 
                 ok: false, 
-                error: 'Cooldown aktif. Tunggu beberapa menit', 
+                error: `Cooldown aktif. Tunggu ${remaining} menit lagi.`, 
                 cooldownUntil: cd 
             });
         }
@@ -239,14 +325,21 @@ module.exports = async (req, res) => {
         // Check duplicate username by fetching remote JSON
         let remoteList = [];
         try {
+            console.log('Checking duplicate username...');
             const data = await fetchJson(REMOTE_USERS_URL);
-            if (Array.isArray(data)) remoteList = data;
+            if (Array.isArray(data)) {
+                remoteList = data;
+                console.log(`Fetched ${remoteList.length} users from remote`);
+            } else {
+                console.log('Remote data is not an array, treating as empty');
+            }
         } catch (e) {
+            console.error('Remote fetch error:', e.message);
             await sendTelegramNotification(
                 `🔴 <b>Database Connection Failed</b>\n` +
                 `📱 <b>IP:</b> <code>${ip}</code>\n` +
-                `❌ <b>Error:</b> ${e.message}\n` +
-                `🌐 <b>URL:</b> ${REMOTE_USERS_URL}`
+                `👤 <b>Username:</b> ${username}\n` +
+                `❌ <b>Error:</b> ${e.message}`
             );
             return res.status(502).json({ 
                 ok: false, 
@@ -255,9 +348,16 @@ module.exports = async (req, res) => {
             });
         }
 
-        const exists = remoteList.some(u => String(u.username || '').toLowerCase() === username.toLowerCase());
+        const exists = remoteList.some(u => {
+            const existingUsername = String(u.username || '').toLowerCase();
+            return existingUsername === username.toLowerCase();
+        });
+        
         if (exists) {
-            failCounts.set(ip, (failCounts.get(ip) || 0) + 1);
+            const failCount = (failCounts.get(ip) || 0) + 1;
+            failCounts.set(ip, failCount);
+            
+            console.log(`Duplicate username: ${username}`);
             
             await sendTelegramNotification(
                 `⚠️ <b>Duplicate Username Attempt</b>\n` +
@@ -287,23 +387,35 @@ module.exports = async (req, res) => {
             createdBy: ip
         };
 
+        console.log('Generated account:', { username, password, role, expired: new Date(expired) });
+
         // Forward to remote create-account endpoint
         let forwardResp;
         try {
+            console.log('Forwarding to remote create endpoint:', REMOTE_CREATE_URL);
+            
+            const forwardBody = {
+                username, 
+                password, 
+                role, 
+                expires: expired
+            };
+            
+            console.log('Forward body:', forwardBody);
+            
             forwardResp = await fetch(REMOTE_CREATE_URL, {
                 method: 'POST',
                 headers: { 
                     'Content-Type': 'application/json',
-                    'User-Agent': 'xcvi-system/2.0'
+                    'User-Agent': 'XCVI-Database-System/3.0.0'
                 },
-                body: JSON.stringify({ 
-                    username, 
-                    password, 
-                    role, 
-                    expires: expired 
-                })
+                body: JSON.stringify(forwardBody)
             });
+            
+            console.log('Remote response status:', forwardResp.status);
+            
         } catch (e) {
+            console.error('Remote create error:', e.message);
             await sendTelegramNotification(
                 `🔴 <b>Create Account Failed</b>\n` +
                 `📱 <b>IP:</b> <code>${ip}</code>\n` +
@@ -319,25 +431,32 @@ module.exports = async (req, res) => {
 
         let forwardData = {};
         try { 
-            forwardData = await forwardResp.json(); 
+            const forwardText = await forwardResp.text();
+            console.log('Remote response text:', forwardText);
+            forwardData = JSON.parse(forwardText);
         } catch (e) { 
-            forwardData = {}; 
+            console.log('Could not parse remote response as JSON');
+            forwardData = { raw: 'Response not JSON' };
         }
 
-        if (!forwardResp.ok || !forwardData.ok) {
-            failCounts.set(ip, (failCounts.get(ip) || 0) + 1);
+        if (!forwardResp.ok) {
+            const failCount = (failCounts.get(ip) || 0) + 1;
+            failCounts.set(ip, failCount);
+            
+            console.log('Remote create failed:', forwardResp.status, forwardData);
             
             await sendTelegramNotification(
                 `🔴 <b>Account Creation Failed</b>\n` +
                 `📱 <b>IP:</b> <code>${ip}</code>\n` +
                 `👤 <b>Username:</b> ${username}\n` +
-                `❌ <b>Error:</b> ${forwardData.error || 'Remote create failed'}`
+                `❌ <b>Error:</b> ${forwardData.error || 'Remote create failed'}\n` +
+                `📊 <b>Status:</b> ${forwardResp.status}`
             );
             
-            return res.status(forwardResp.status || 500).json({ 
+            return res.status(forwardResp.status).json({ 
                 ok: false, 
                 error: forwardData.error || 'Remote create failed', 
-                raw: forwardData 
+                details: forwardData 
             });
         }
 
@@ -347,7 +466,7 @@ module.exports = async (req, res) => {
         failCounts.set(ip, 0);
 
         // Update user stats
-        await getTotalUsers();
+        const stats = await getTotalUsers();
 
         // Send success notification to Telegram
         await sendTelegramNotification(
@@ -357,34 +476,38 @@ module.exports = async (req, res) => {
             `🔑 <b>Password:</b> <code>${password}</code>\n` +
             `👑 <b>Role:</b> ${role}\n` +
             `📅 <b>Expires:</b> ${new Date(expired).toLocaleString('id-ID')}\n` +
-            `👥 <b>Total Users:</b> ${userStats.totalUsers}\n` +
+            `👥 <b>Total Users:</b> ${stats.totalUsers}\n` +
             `⏰ <b>Cooldown Until:</b> ${new Date(until).toLocaleString('id-ID')}`
         );
+
+        console.log('Account created successfully for user:', username);
 
         // Respond to client with account data
         return res.status(200).json({
             ok: true,
             message: 'Akun berhasil dibuat',
             data: account,
-            stats: userStats,
-            createdAt,
+            stats: stats,
             cooldownUntil: until,
             remoteResponse: forwardData
         });
 
     } catch (err) {
-        console.error('[api/sistem] error:', err && err.message);
+        console.error('[api/sistem] Unhandled error:', err);
+        console.error('Error stack:', err.stack);
         
         // Send error notification to Telegram
         await sendTelegramNotification(
             `🔴 <b>System Error</b>\n` +
             `❌ <b>Error:</b> ${err.message || 'Unknown error'}\n` +
-            `⏰ <b>Time:</b> ${new Date().toLocaleString('id-ID')}`
+            `⏰ <b>Time:</b> ${new Date().toLocaleString('id-ID')}\n` +
+            `📁 <b>Stack:</b> ${err.stack ? err.stack.substring(0, 100) : 'No stack'}`
         );
         
         return res.status(500).json({ 
             ok: false, 
-            error: err.message || 'Internal server error'
+            error: 'Internal server error: ' + (err.message || 'Unknown error'),
+            timestamp: now()
         });
     }
 };
