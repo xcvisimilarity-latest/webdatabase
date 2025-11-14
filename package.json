@@ -1,0 +1,13 @@
+{
+  "name": "xcvi-database-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Frontend + API kecil untuk membuat akun XCVI",
+  "scripts": {
+    "start": "vercel dev --listen 3000",
+    "build": "echo 'static site'"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
