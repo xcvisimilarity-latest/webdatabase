@@ -513,29 +513,32 @@ try {
     });
 }
 
-        const exists = remoteList.some(u => {
-            const existingUsername = String(u.username || '').toLowerCase();
-            return existingUsername === username.toLowerCase();
-        });
-        
-        if (exists) {
-            const failCount = (failCounts.get(ip) || 0) + 1;
-            failCounts.set(ip, failCount);
-            
-            console.log(`Duplicate username: ${username}`);
-            
-            await sendTelegramNotification(
-                `⚠️ <b>Duplicate Username Attempt</b>\n` +
-                `📱 <b>IP:</b> <code>${ip}</code>\n` +
-                `👤 <b>Username:</b> ${username}\n` +
-                `❌ <b>Status:</b> Already exists in database`
-            );
-            
-            return res.status(409).json({ 
-                ok: false, 
-                error: 'Username sudah ada. Pilih username lain.' 
-            });
-        }
+        // --- robust duplicate-check + authoritative re-check via fetchRemoteUsers
+const exists = remoteList.some(u => {
+  const existingUsername = String(u.username || '').toLowerCase();
+  return existingUsername === username.toLowerCase();
+});
+
+if (exists) {
+  // quick re-check using authoritative source (GitHub API fallback)
+  try {
+    console.log('[sistem] Duplicate detected locally — performing authoritative re-check');
+    const fresh = await fetchRemoteUsers({ retries: 2, retryDelayMs: 300, timeoutMs: 8000 });
+    const freshExists = Array.isArray(fresh) && fresh.some(u => String(u.username || '').toLowerCase() === username.toLowerCase());
+    if (freshExists) {
+      console.log('[sistem] Authoritative check: username exists -> returning 409');
+      await sendTelegramNotification(`⚠️ Duplicate Confirmed: ${username} (IP ${ip})`);
+      return res.status(409).json({ ok: false, error: 'Username sudah ada. Pilih username lain.' });
+    } else {
+      // transient: the local cache said exists but authoritative source does not -> proceed with caution
+      console.warn('[sistem] Transient: local cache said exists but authoritative source did not. Proceeding to attempt create.');
+    }
+  } catch (e) {
+    console.warn('[sistem] Authoritative re-check failed:', String(e?.message || e));
+    // If authoritative check fails, best to be conservative: return 409 (or optionally try create once)
+    return res.status(409).json({ ok: false, error: 'Username sudah ada. Pilih username lain.' });
+  }
+}
 
         // Generate credentials
         const password = genPassword();
