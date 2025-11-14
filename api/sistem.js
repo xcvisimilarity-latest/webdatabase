@@ -234,13 +234,14 @@ function normalizePossiblyUnquotedJson(text) {
 }
 
 
-// === REPLACED fetchRemoteUsers
+// === fetchRemoteUsers: robust + cache + GitHub API fallback (no recursion) ===
 async function fetchRemoteUsers(opts = {}) {
-  const cached = getUsersCache();
-if (cached) {
-  console.log('[sistem] Returning cached users -', cached.length);
-  return cached;
-}
+  const cached = getUsersCache ? getUsersCache() : null;
+  if (cached) {
+    console.log('[sistem] Returning cached users -', cached.length);
+    return cached;
+  }
+
   const retries = typeof opts.retries === 'number' ? opts.retries : 3;
   const retryDelayMs = typeof opts.retryDelayMs === 'number' ? opts.retryDelayMs : 600;
   const timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : 10000;
@@ -252,15 +253,26 @@ if (cached) {
 
   for (let i = 0; i < retries; i++) {
     try {
-      // IMPORTANT: call fetchJson (not fetchRemoteUsers). Fixed recursion bug.
-      const data = await fetchJson(cacheBustedUrl, { timeout: timeoutMs });
-      if (Array.isArray(data)) {
-        console.log(`[sistem] fetchRemoteUsers success (attempt ${i+1}) - ${data.length} users`);
-        setUsersCache(data);
-return data;
-      } else {
-        // if remote returned object (e.g. error HTML), throw so we retry/fallback
+      // Use fetchJson (safe fetch + timeout) if available; else fallback to fetch
+      if (typeof fetchJson === 'function') {
+        const data = await fetchJson(cacheBustedUrl, { timeout: timeoutMs });
+        if (Array.isArray(data)) {
+          console.log(`[sistem] fetchRemoteUsers success (attempt ${i+1}) - ${data.length} users`);
+          if (typeof setUsersCache === 'function') setUsersCache(data);
+          return data;
+        }
         throw new Error('Remote payload is not an array');
+      } else {
+        const resp = await fetch(cacheBustedUrl, { redirect: 'follow' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const txt = await resp.text();
+        const norm = normalizePossiblyUnquotedJson(txt || '');
+        const parsed = JSON.parse(norm);
+        if (Array.isArray(parsed)) {
+          if (typeof setUsersCache === 'function') setUsersCache(parsed);
+          return parsed;
+        }
+        throw new Error('Remote payload not array');
       }
     } catch (e) {
       lastErr = e;
@@ -269,7 +281,7 @@ return data;
     }
   }
 
-  // Fallback: try GitHub API /contents for more consistent read after commit
+  // Fallback: GitHub API /contents (authoritative)
   try {
     if (typeof REMOTE_USERS_URL === 'string' && REMOTE_USERS_URL.includes('raw.githubusercontent.com')) {
       const m = REMOTE_USERS_URL.match(/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/(.+)/);
@@ -284,33 +296,32 @@ return data;
         const headers = { 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'XCVI-Database-System/3.0.0' };
         if (token) headers.Authorization = `token ${token}`;
 
-        // use AbortController for timeout
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(), timeoutMs);
         try {
           const resp = await fetch(apiUrl, { headers, redirect: 'follow', signal: ac.signal });
           clearTimeout(timer);
           if (!resp.ok) {
-            const txt = await resp.text().catch(() => '');
+            const txt = await resp.text().catch(()=>'');
             console.warn('[sistem] GitHub API fallback non-OK:', resp.status, txt.substring(0,200));
           } else {
-            const body = await resp.json().catch(() => null);
+            const body = await resp.json().catch(()=>null);
             if (body && body.content) {
               const content = Buffer.from(body.content || '', 'base64').toString('utf8');
               const normalized = normalizePossiblyUnquotedJson(content);
               const parsed = JSON.parse(normalized);
               if (Array.isArray(parsed)) {
-  console.log('[sistem] GitHub API fallback success - users:', parsed.length);
-  setUsersCache(parsed);
-  return parsed;
-}
+                console.log('[sistem] GitHub API fallback success - users:', parsed.length);
+                if (typeof setUsersCache === 'function') setUsersCache(parsed);
+                return parsed;
+              }
             }
           }
         } catch (e) {
           if (e.name === 'AbortError') console.warn('[sistem] GitHub API fallback timed out');
           else console.warn('[sistem] GitHub API fallback error:', String(e?.message || e));
         } finally {
-          try { clearTimeout(timer); } catch (_) {}
+          try{ clearTimeout(timer); }catch(_){}
         }
       }
     }
@@ -513,14 +524,14 @@ try {
     });
 }
 
-        // --- robust duplicate-check + authoritative re-check via fetchRemoteUsers
+
 const exists = remoteList.some(u => {
   const existingUsername = String(u.username || '').toLowerCase();
   return existingUsername === username.toLowerCase();
 });
 
 if (exists) {
-  // quick re-check using authoritative source (GitHub API fallback)
+
   try {
     console.log('[sistem] Duplicate detected locally — performing authoritative re-check');
     const fresh = await fetchRemoteUsers({ retries: 2, retryDelayMs: 300, timeoutMs: 8000 });
@@ -530,12 +541,12 @@ if (exists) {
       await sendTelegramNotification(`⚠️ Duplicate Confirmed: ${username} (IP ${ip})`);
       return res.status(409).json({ ok: false, error: 'Username sudah ada. Pilih username lain.' });
     } else {
-      // transient: the local cache said exists but authoritative source does not -> proceed with caution
+
       console.warn('[sistem] Transient: local cache said exists but authoritative source did not. Proceeding to attempt create.');
     }
   } catch (e) {
     console.warn('[sistem] Authoritative re-check failed:', String(e?.message || e));
-    // If authoritative check fails, best to be conservative: return 409 (or optionally try create once)
+
     return res.status(409).json({ ok: false, error: 'Username sudah ada. Pilih username lain.' });
   }
 }
