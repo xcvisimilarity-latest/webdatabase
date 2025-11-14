@@ -8,6 +8,6 @@
     "build": "echo 'static site'"
   },
   "engines": {
-    "node": ">=18"
+    "node": "22.x"
   }
 }
