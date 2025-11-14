@@ -131,26 +131,56 @@ async function fetchJson(url) {
     }
 }
 
-async function getTotalUsers() {
+// ========== REPLACE getTotalUsers() ==========
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function getTotalUsers(options = {}) {
+    // options: { retries: number, retryDelayMs: number }
+    const retries = (options.retries != null) ? options.retries : 3;
+    const retryDelayMs = (options.retryDelayMs != null) ? options.retryDelayMs : 700;
+
     try {
         console.log('Getting user stats from:', REMOTE_USERS_URL);
-        const data = await fetchJson(REMOTE_USERS_URL);
-        
-        if (Array.isArray(data)) {
-            userStats.totalUsers = data.length;
-            userStats.premiumUsers = data.filter(u => u.role === 'premium').length;
-            console.log(`Stats updated - Total: ${userStats.totalUsers}, Premium: ${userStats.premiumUsers}`);
-        } else {
-            console.log('Remote data is not an array:', typeof data);
+
+        // cache-buster only for raw.githubusercontent to avoid stale CDN cache
+        let url = REMOTE_USERS_URL;
+        if (typeof url === 'string' && url.includes('raw.githubusercontent.com')) {
+            url = url + (url.includes('?') ? '&' : '?') + 't=' + Date.now();
+            console.log('Using cache-busted URL for GitHub raw:', url);
         }
-        
-        return userStats;
+
+        let lastErr = null;
+        for (let i = 0; i < retries; i++) {
+            try {
+                const data = await fetchJson(url);
+
+                if (Array.isArray(data)) {
+                    userStats.totalUsers = data.length;
+                    userStats.premiumUsers = data.filter(u => u.role === 'premium').length;
+                    console.log(`Stats updated - Total: ${userStats.totalUsers}, Premium: ${userStats.premiumUsers}`);
+                    return userStats;
+                } else {
+                    console.log('Remote data is not an array:', typeof data);
+                    // if not array, throw to trigger retry
+                    throw new Error('Remote users JSON not array');
+                }
+            } catch (err) {
+                lastErr = err;
+                console.warn(`getTotalUsers attempt ${i+1} failed:`, err.message || err);
+                if (i < retries - 1) await sleep(retryDelayMs);
+            }
+        }
+
+        // if we reach here all attempts failed
+        console.error('getTotalUsers: all retries failed:', lastErr && lastErr.message);
+        // fallback to current in-memory stats or defaults
+        return { totalUsers: userStats.totalUsers || 15842, premiumUsers: userStats.premiumUsers || 14258 };
     } catch (error) {
-        console.error('Failed to fetch user stats:', error.message);
-        // Return default stats if fetch fails
-        return { totalUsers: 15842, premiumUsers: 14258 };
+        console.error('Failed to fetch user stats unexpected:', error.message);
+        return { totalUsers: userStats.totalUsers || 15842, premiumUsers: userStats.premiumUsers || 14258 };
     }
 }
+// ==============================================
 
 module.exports = async (req, res) => {
     console.log('=== XCVI API Request ===');
@@ -465,10 +495,20 @@ module.exports = async (req, res) => {
         cooldowns.set(ip, until);
         failCounts.set(ip, 0);
 
-        // Update user stats
-        const stats = await getTotalUsers();
+        // --- Optimistic update: segera reflect perubahan di memori supaya UI cepat responsif
+        userStats.totalUsers = (userStats.totalUsers || 0) + 1;
 
-        // Send success notification to Telegram
+        // --- Try to re-fetch fresh stats (with retries). If fetch fails, fall back to optimistic stats.
+        let stats;
+        try {
+            // request a fresh fetch (getTotalUsers has built-in retries + cache-buster)
+            stats = await getTotalUsers({ retries: 3, retryDelayMs: 700 });
+        } catch (e) {
+            console.warn('Warning: getTotalUsers failed after create, using in-memory optimistic stats:', e && e.message);
+            stats = { totalUsers: userStats.totalUsers || 0, premiumUsers: userStats.premiumUsers || 0 };
+        }
+
+        // --- Send success notification to Telegram (will include stats)
         await sendTelegramNotification(
             `✅ <b>New Account Created Successfully</b>\n` +
             `📱 <b>IP:</b> <code>${ip}</code>\n` +
@@ -482,7 +522,7 @@ module.exports = async (req, res) => {
 
         console.log('Account created successfully for user:', username);
 
-        // Respond to client with account data
+        
         return res.status(200).json({
             ok: true,
             message: 'Akun berhasil dibuat',
