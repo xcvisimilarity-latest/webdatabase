@@ -5,8 +5,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "8207201116:AAHyth3
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "7950114253";
 
 // ===== SYSTEM CONFIGURATION =====
-const MIN_EXPIRE_DAYS = 10;
-const MAX_EXPIRE_DAYS = 30;
+const MIN_EXPIRE_DAYS = 3;
+const MAX_EXPIRE_DAYS = 7;
 const COOLDOWN_MS = 5 * 60 * 1000; // 5 menit
 const BAN_THRESHOLD = 30;
 const BAN_DURATION_MS = 60 * 60 * 1000; // 1 jam
