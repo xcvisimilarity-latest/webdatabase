@@ -135,50 +135,44 @@ async function fetchJson(url) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function getTotalUsers(options = {}) {
-    // options: { retries: number, retryDelayMs: number }
-    const retries = (options.retries != null) ? options.retries : 3;
-    const retryDelayMs = (options.retryDelayMs != null) ? options.retryDelayMs : 700;
+  const retries = (options.retries != null) ? options.retries : 3;
+  const retryDelayMs = (options.retryDelayMs != null) ? options.retryDelayMs : 700;
 
-    try {
-        console.log('Getting user stats from:', REMOTE_USERS_URL);
+  try {
+    console.log('Getting user stats from:', REMOTE_USERS_URL);
 
-        // cache-buster only for raw.githubusercontent to avoid stale CDN cache
-        let url = REMOTE_USERS_URL;
-        if (typeof url === 'string' && url.includes('raw.githubusercontent.com')) {
-            url = url + (url.includes('?') ? '&' : '?') + 't=' + Date.now();
-            console.log('Using cache-busted URL for GitHub raw:', url);
-        }
-
-        let lastErr = null;
-        for (let i = 0; i < retries; i++) {
-            try {
-                const data = await fetchJson(url);
-
-                if (Array.isArray(data)) {
-                    userStats.totalUsers = data.length;
-                    userStats.premiumUsers = data.filter(u => u.role === 'premium').length;
-                    console.log(`Stats updated - Total: ${userStats.totalUsers}, Premium: ${userStats.premiumUsers}`);
-                    return userStats;
-                } else {
-                    console.log('Remote data is not an array:', typeof data);
-                    // if not array, throw to trigger retry
-                    throw new Error('Remote users JSON not array');
-                }
-            } catch (err) {
-                lastErr = err;
-                console.warn(`getTotalUsers attempt ${i+1} failed:`, err.message || err);
-                if (i < retries - 1) await sleep(retryDelayMs);
-            }
-        }
-
-        // if we reach here all attempts failed
-        console.error('getTotalUsers: all retries failed:', lastErr && lastErr.message);
-        // fallback to current in-memory stats or defaults
-        return { totalUsers: userStats.totalUsers || 15842, premiumUsers: userStats.premiumUsers || 14258 };
-    } catch (error) {
-        console.error('Failed to fetch user stats unexpected:', error.message);
-        return { totalUsers: userStats.totalUsers || 15842, premiumUsers: userStats.premiumUsers || 14258 };
+    // cache-buster only for raw.githubusercontent to avoid stale CDN cache
+    let url = REMOTE_USERS_URL;
+    if (typeof url === 'string' && url.includes('raw.githubusercontent.com')) {
+      url = url + (url.includes('?') ? '&' : '?') + 't=' + Date.now();
+      console.log('Using cache-busted URL for GitHub raw:', url);
     }
+
+    let lastErr = null;
+    for (let i = 0; i < retries; i++) {
+      try {
+        const data = await fetchJson(url);
+
+        if (Array.isArray(data)) {
+          userStats.totalUsers = data.length;
+          userStats.premiumUsers = data.filter(u => u.role === 'premium').length;
+          return userStats;
+        } else {
+          throw new Error('Remote users JSON not array');
+        }
+      } catch (err) {
+        lastErr = err;
+        console.warn(`getTotalUsers attempt ${i+1} failed:`, err.message || err);
+        if (i < retries - 1) await sleep(retryDelayMs);
+      }
+    }
+
+    console.error('getTotalUsers: all retries failed:', lastErr && lastErr.message);
+    return { totalUsers: userStats.totalUsers || 15842, premiumUsers: userStats.premiumUsers || 14258 };
+  } catch (err) {
+    console.error('Failed to fetch user stats unexpected:', err.message);
+    return { totalUsers: userStats.totalUsers || 15842, premiumUsers: userStats.premiumUsers || 14258 };
+  }
 }
 // ==============================================
 
