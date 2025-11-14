@@ -18,6 +18,20 @@ let recentReqs = new Map();
 let failCounts = new Map();
 let userStats = { totalUsers: 0, premiumUsers: 0 };
 
+// ===== Simple in-memory  =====
+let __usersCache = { ts: 0, ttl: 3000, data: null };
+
+function getUsersCache() {
+  if (__usersCache.data && (Date.now() - __usersCache.ts) < __usersCache.ttl) {
+    return __usersCache.data;
+  }
+  return null;
+}
+
+function setUsersCache(data) {
+  __usersCache = { ts: Date.now(), ttl: 3000, data };
+}
+
 // Telegram notification function
 async function sendTelegramNotification(message) {
     try {
@@ -104,31 +118,48 @@ function genExpiryMs() {
     return Date.now() + days * 24 * 3600 * 1000;
 }
 
-async function fetchJson(url) {
-    console.log('Fetching from:', url);
-    try {
-        const resp = await fetch(url, { 
-            method: 'GET', 
-            headers: { 
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'application/json'
-            },
-            timeout: 10000
-        });
-        
-        if (!resp.ok) {
-            throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
-        }
-        
-        const text = await resp.text();
-        console.log('Raw response:', text.substring(0, 200));
-        
-        const data = JSON.parse(text);
-        return data;
-    } catch (error) {
-        console.error('Fetch error:', error.message);
-        throw error;
+// === REPLACE fetchJson with robust AbortController + redirect follow ===
+async function fetchJson(url, opts = {}) {
+  const timeoutMs = typeof opts.timeout === 'number' ? opts.timeout : 10000;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+
+  try {
+    console.log(`[sistem] fetchJson -> ${url} (timeout ${timeoutMs}ms)`);
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'XCVI-Database-System/3.0.0',
+        'Accept': 'application/json, text/plain, */*'
+      },
+      redirect: 'follow',
+      signal: ac.signal
+    });
+
+    clearTimeout(timer);
+
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw new Error(`HTTP ${resp.status}: ${txt || resp.statusText}`);
     }
+
+    const text = await resp.text().catch(() => '');
+    console.log('[sistem] fetchJson raw (truncated):', text ? text.substring(0, 300) : '<empty>');
+    const normalized = normalizePossiblyUnquotedJson(text || '');
+    try {
+      const data = JSON.parse(normalized);
+      return data;
+    } catch (parseErr) {
+      throw new Error('Failed to parse JSON from remote: ' + (parseErr.message || parseErr));
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('Request timed out');
+    }
+    throw err;
+  } finally {
+    try { clearTimeout(timer); } catch (_) {}
+  }
 }
 
 // ========== REPLACE getTotalUsers() ==========
@@ -151,11 +182,11 @@ async function getTotalUsers(options = {}) {
     let lastErr = null;
     for (let i = 0; i < retries; i++) {
       try {
-        const data = await fetchJson(url);
+        const data = await fetchRemoteUsers({ retries: 3, retryDelayMs: 700, timeoutMs: 10000 });
 
         if (Array.isArray(data)) {
           userStats.totalUsers = data.length;
-          userStats.premiumUsers = data.filter(u => u.role === 'premium').length;
+          userStats.premiumUsers = data.filter(u => String(u.role || '').toLowerCase() === 'premium').length;
           return userStats;
         } else {
           throw new Error('Remote users JSON not array');
@@ -175,44 +206,61 @@ async function getTotalUsers(options = {}) {
   }
 }
 
-// --- fetchRemoteUsers: cache-buster + retries + GitHub API fallback
-async function fetchRemoteUsers(opts = {}) {
-  const retries = opts.retries ?? 3;
-  const retryDelayMs = opts.retryDelayMs ?? 600;
-  const nowTs = Date.now();
 
-  // build cache-busted URL for raw.githubusercontent
-  let url = REMOTE_USERS_URL;
-  if (typeof url === 'string' && url.includes('raw.githubusercontent.com')) {
-    url = url + (url.includes('?') ? '&' : '?') + 't=' + nowTs;
-    console.log('[sistem] Using cache-busted raw URL:', url);
+function normalizePossiblyUnquotedJson(text) {
+  if (!text || !String(text).trim()) return '[]';
+  try {
+    // If already valid JSON, return as-is
+    JSON.parse(text);
+    return text;
+  } catch (e) {
+    try {
+      // add quotes to unquoted keys: { key: -> { "key":
+      let fixed = String(text).replace(/([{,]\s*)([-A-Za-z0-9_$]+)\s*:/g, '$1"$2":');
+      // convert single quotes to double quotes
+      fixed = fixed.replace(/'/g, '"');
+      JSON.parse(fixed);
+      return fixed;
+    } catch (e2) {
+      // try extract first JSON array or object substring
+      const arrMatch = String(text).match(/\[.*\]/s);
+      if (arrMatch) return arrMatch[0];
+      const objMatch = String(text).match(/\{.*\}/s);
+      if (objMatch) return objMatch[0];
+      // else return original (will likely fail upstream but we did our best)
+      return text;
+    }
   }
+}
+
+
+// === REPLACED fetchRemoteUsers
+async function fetchRemoteUsers(opts = {}) {
+  const cached = getUsersCache();
+if (cached) {
+  console.log('[sistem] Returning cached users -', cached.length);
+  return cached;
+}
+  const retries = typeof opts.retries === 'number' ? opts.retries : 3;
+  const retryDelayMs = typeof opts.retryDelayMs === 'number' ? opts.retryDelayMs : 600;
+  const timeoutMs = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : 10000;
+
+  const baseUrl = REMOTE_USERS_URL;
+  const cacheBustedUrl = baseUrl + (baseUrl.includes('?') ? '&' : '?') + 't=' + Date.now();
 
   let lastErr = null;
+
   for (let i = 0; i < retries; i++) {
     try {
-      const resp = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'User-Agent': 'XCVI-Database-System/3.0.0',
-          'Accept': 'application/json'
-        },
-        timeout: 10000
-      });
-      const text = await resp.text();
-      if (!resp.ok) {
-        lastErr = new Error(`HTTP ${resp.status} when reading users: ${text.substring(0,200)}`);
-        throw lastErr;
-      }
-      // try parse json (normalize first in case of sloppy formatting)
-      const normalized = normalizePossiblyUnquotedJson(text);
-      const data = JSON.parse(normalized);
+      // IMPORTANT: call fetchJson (not fetchRemoteUsers). Fixed recursion bug.
+      const data = await fetchJson(cacheBustedUrl, { timeout: timeoutMs });
       if (Array.isArray(data)) {
         console.log(`[sistem] fetchRemoteUsers success (attempt ${i+1}) - ${data.length} users`);
-        return data;
+        setUsersCache(data);
+return data;
       } else {
-        lastErr = new Error('Remote users payload is not an array');
-        throw lastErr;
+        // if remote returned object (e.g. error HTML), throw so we retry/fallback
+        throw new Error('Remote payload is not an array');
       }
     } catch (e) {
       lastErr = e;
@@ -221,40 +269,56 @@ async function fetchRemoteUsers(opts = {}) {
     }
   }
 
-  // fallback: try GitHub API contents endpoint if URL points to raw.githubusercontent
+  // Fallback: try GitHub API /contents for more consistent read after commit
   try {
     if (typeof REMOTE_USERS_URL === 'string' && REMOTE_USERS_URL.includes('raw.githubusercontent.com')) {
-      // try reconstruct owner/repo/path
-      const m = REMOTE_USERS_URL.match(/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)/);
+      const m = REMOTE_USERS_URL.match(/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/(.+)/);
       if (m) {
         const owner = m[1], repo = m[2];
-        const pathParts = REMOTE_USERS_URL.split('/').slice(5); // after /raw/owner/repo/
-        const possiblePath = pathParts.join('/');
-        const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${possiblePath}`;
+        let rest = m[3];
+        if (rest.startsWith('refs/heads/')) rest = rest.slice('refs/heads/'.length);
+        const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${rest}`;
         console.log('[sistem] Trying GitHub API fallback:', apiUrl);
+
         const token = process.env.GITHUB_TOKEN || global.GITHUB_TOKEN;
-        const headers = { Accept: 'application/vnd.github.v3+json', 'User-Agent': 'XCVI-Database-System/3.0.0' };
+        const headers = { 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'XCVI-Database-System/3.0.0' };
         if (token) headers.Authorization = `token ${token}`;
-        const res = await fetch(apiUrl, { headers, timeout: 10000 });
-        if (res.ok) {
-          const body = await res.json();
-          if (body && body.content) {
-            const content = Buffer.from(body.content, 'base64').toString('utf8');
-            const normalized = normalizePossiblyUnquotedJson(content);
-            const parsed = JSON.parse(normalized);
-            if (Array.isArray(parsed)) return parsed;
+
+        // use AbortController for timeout
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), timeoutMs);
+        try {
+          const resp = await fetch(apiUrl, { headers, redirect: 'follow', signal: ac.signal });
+          clearTimeout(timer);
+          if (!resp.ok) {
+            const txt = await resp.text().catch(() => '');
+            console.warn('[sistem] GitHub API fallback non-OK:', resp.status, txt.substring(0,200));
+          } else {
+            const body = await resp.json().catch(() => null);
+            if (body && body.content) {
+              const content = Buffer.from(body.content || '', 'base64').toString('utf8');
+              const normalized = normalizePossiblyUnquotedJson(content);
+              const parsed = JSON.parse(normalized);
+              if (Array.isArray(parsed)) {
+  console.log('[sistem] GitHub API fallback success - users:', parsed.length);
+  setUsersCache(parsed);
+  return parsed;
+}
+            }
           }
-        } else {
-          console.warn('[sistem] GitHub API fallback failed status:', res.status);
+        } catch (e) {
+          if (e.name === 'AbortError') console.warn('[sistem] GitHub API fallback timed out');
+          else console.warn('[sistem] GitHub API fallback error:', String(e?.message || e));
+        } finally {
+          try { clearTimeout(timer); } catch (_) {}
         }
       }
     }
   } catch (e) {
-    console.warn('[sistem] GitHub API fallback error:', String(e?.message || e));
+    console.warn('[sistem] GitHub API fallback outer error:', String(e?.message || e));
   }
 
-  // final: throw last error so caller knows fetch failed
-  throw lastErr || new Error('Failed to fetch remote users');
+  throw lastErr || new Error('Failed to fetch remote users after retries');
 }
 // ==============================================
 
@@ -492,52 +556,78 @@ try {
 
         // Forward to remote create-account endpoint
         let forwardResp;
+       
+        let forwardData = {};
         try {
             console.log('Forwarding to remote create endpoint:', REMOTE_CREATE_URL);
-            
-            const forwardBody = {
-                username, 
-                password, 
-                role, 
-                expires: expired
-            };
-            
-            console.log('Forward body:', forwardBody);
-            
-            forwardResp = await fetch(REMOTE_CREATE_URL, {
-                method: 'POST',
-                headers: { 
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'XCVI-Database-System/3.0.0'
-                },
-                body: JSON.stringify(forwardBody)
-            });
-            
-            console.log('Remote response status:', forwardResp.status);
-            
+
+            const forwardBody = { username, password, role, expires: expired };
+            const forwardPayload = JSON.stringify(forwardBody);
+            console.log('Forward body (truncated):', JSON.stringify({ username, role, expires: new Date(expired).toISOString() }));
+
+            // small retry attempts for transient network problems
+            const FORWARD_RETRIES = 2;
+            const FORWARD_TIMEOUT_MS = 10000;
+            let forwardRespLocal = null;
+            for (let fi = 0; fi < FORWARD_RETRIES; fi++) {
+                const ac = new AbortController();
+                const tid = setTimeout(() => ac.abort(), FORWARD_TIMEOUT_MS);
+                try {
+                    forwardRespLocal = await fetch(REMOTE_CREATE_URL, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'User-Agent': 'XCVI-Database-System/3.0.0'
+                        },
+                        body: forwardPayload,
+                        signal: ac.signal,
+                        redirect: 'follow'
+                    });
+                    clearTimeout(tid);
+                    console.log(`Remote response status (attempt ${fi+1}):`, forwardRespLocal.status);
+                    // break out on any response (we will handle non-ok below)
+                    break;
+                } catch (err) {
+                    clearTimeout(tid);
+                    console.warn(`Forward attempt ${fi+1} failed:`, String(err?.message || err));
+                    if (fi === FORWARD_RETRIES - 1) throw err;
+                    await new Promise(r => setTimeout(r, 500 + fi * 200));
+                }
+            }
+
+            if (!forwardRespLocal) throw new Error('No response from remote create endpoint');
+
+            // try parse JSON safely
+            const contentType = (forwardRespLocal.headers && forwardRespLocal.headers.get && forwardRespLocal.headers.get('content-type')) || '';
+            const forwardText = await forwardRespLocal.text().catch(() => '');
+            console.log('Remote response text (truncated):', forwardText ? forwardText.substring(0,400) : '<empty>');
+
+            try {
+                if (contentType.includes('application/json') || forwardText.trim().startsWith('{') || forwardText.trim().startsWith('[')) {
+                    forwardData = JSON.parse(forwardText);
+                } else {
+                    forwardData = { raw: forwardText };
+                }
+            } catch (parseErr) {
+                console.warn('Could not parse remote response as JSON:', parseErr.message);
+                forwardData = { raw: forwardText };
+            }
+
+            forwardResp = forwardRespLocal;
+
         } catch (e) {
-            console.error('Remote create error:', e.message);
+            console.error('Remote create error:', String(e?.message || e));
             await sendTelegramNotification(
                 `🔴 <b>Create Account Failed</b>\n` +
                 `📱 <b>IP:</b> <code>${ip}</code>\n` +
                 `👤 <b>Username:</b> ${username}\n` +
-                `❌ <b>Error:</b> ${e.message}`
+                `❌ <b>Error:</b> ${String(e?.message || e)}`
             );
-            return res.status(502).json({ 
-                ok: false, 
-                error: 'Gagal memanggil server create-account', 
-                details: e.message 
+            return res.status(502).json({
+                ok: false,
+                error: 'Gagal memanggil server create-account',
+                details: String(e?.message || e)
             });
-        }
-
-        let forwardData = {};
-        try { 
-            const forwardText = await forwardResp.text();
-            console.log('Remote response text:', forwardText);
-            forwardData = JSON.parse(forwardText);
-        } catch (e) { 
-            console.log('Could not parse remote response as JSON');
-            forwardData = { raw: 'Response not JSON' };
         }
 
         if (!forwardResp.ok) {
